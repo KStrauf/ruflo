@@ -85,6 +85,13 @@ on:
       # in callAnthropicMessages must stay wired.
       - 'v3/@claude-flow/cli/src/mcp-tools/agent-execute-core.ts'
       - 'scripts/smoke-agent-execute-providers.mjs'
+      # memory stats legacy-DB regression guard (#2120) — the WHERE
+      # status='active' filter must accept NULL too, and the schema
+      # backfill must promote NULL→'active' on existing DBs.
+      - 'v3/@claude-flow/cli/src/memory/memory-bridge.ts'
+      - 'v3/@claude-flow/cli/src/memory/memory-initializer.ts'
+      - 'v3/@claude-flow/cli/src/commands/status.ts'
+      - 'scripts/smoke-memory-stats-legacy-db.mjs'
       # GitHub skills/agents/helpers surface (#2089, ADR-127) — injection
       # smoke + actions pin smoke gate every change to the .github surface.
       - '.claude/agents/github/**'
@@ -105,6 +112,13 @@ on:
       - 'plugins/*/skills/**'
       - 'plugins/*/commands/**'
       - 'scripts/smoke-init-bundle-invariants.mjs'
+      # ADR-129 — rvagent full integration (P1-P4)
+      - 'v3/@claude-flow/cli/src/ruvector/agent-wasm.ts'
+      - 'v3/@claude-flow/cli/src/mcp-tools/wasm-agent-tools.ts'
+      - 'scripts/smoke-wasm-provider-bridge.mjs'
+      - 'scripts/smoke-wasm-rvf-compose.mjs'
+      - 'scripts/smoke-wasm-gallery-crud.mjs'
+      - 'scripts/smoke-wasm-plugin-bridge.mjs'
   pull_request:
     branches: [main, develop]
     paths:
@@ -165,6 +179,11 @@ on:
       # agent_execute provider routing (#2042)
       - 'v3/@claude-flow/cli/src/mcp-tools/agent-execute-core.ts'
       - 'scripts/smoke-agent-execute-providers.mjs'
+      # memory stats legacy-DB regression (#2120)
+      - 'v3/@claude-flow/cli/src/memory/memory-bridge.ts'
+      - 'v3/@claude-flow/cli/src/memory/memory-initializer.ts'
+      - 'v3/@claude-flow/cli/src/commands/status.ts'
+      - 'scripts/smoke-memory-stats-legacy-db.mjs'
       # GitHub skills/agents/helpers surface (#2089, ADR-127)
       - '.claude/agents/github/**'
       - '.claude/skills/github-*/**'
@@ -183,6 +202,13 @@ on:
       - 'plugins/*/skills/**'
       - 'plugins/*/commands/**'
       - 'scripts/smoke-init-bundle-invariants.mjs'
+      # ADR-129 — rvagent full integration (P1-P4)
+      - 'v3/@claude-flow/cli/src/ruvector/agent-wasm.ts'
+      - 'v3/@claude-flow/cli/src/mcp-tools/wasm-agent-tools.ts'
+      - 'scripts/smoke-wasm-provider-bridge.mjs'
+      - 'scripts/smoke-wasm-rvf-compose.mjs'
+      - 'scripts/smoke-wasm-gallery-crud.mjs'
+      - 'scripts/smoke-wasm-plugin-bridge.mjs'
       # witness manifests / fix list — so witness-verify runs on PRs that
       # touch them (otherwise a stale per-OS manifest only fails post-merge).
       - 'verification/**'
@@ -1039,6 +1065,67 @@ jobs:
       - name: Run agent_execute providers smoke
         run: node scripts/smoke-agent-execute-providers.mjs
 
+  memory-stats-legacy-db-smoke:
+    # Regression guard for ruvnet/ruflo#2120 — `ruflo memory stats` and
+    # `listEntries` returned 0 entries against a populated
+    # `.swarm/memory.db` on WSL2 (reporter: @alexandrelealbess on
+    # alpha.81). Root cause: the `WHERE status = 'active'` filter
+    # excluded rows where the status column was NULL (legacy DBs
+    # created before the status column existed, or via the auto-memory
+    # bridge path that didn't set status).
+    #
+    # Fix: (1) accept `status IS NULL` alongside `'active'` in both
+    # bridgeListEntries and listEntries; (2) backfill `UPDATE
+    # memory_entries SET status = 'active' WHERE status IS NULL` in
+    # ensureSchemaColumns; (3) broaden `isInitialized()` in
+    # `status.ts` to also accept `.swarm/memory.db` existence.
+    #
+    # This smoke builds a 251-entry DB with all-NULL status (mirroring
+    # the reporter's setup), runs listEntries, and asserts total === 251
+    # AND that the backfill promoted all rows to 'active'.
+    name: memory stats legacy-DB smoke (#2120)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup pnpm (workspace-aware install)
+        uses: pnpm/action-setup@v4
+        with:
+          version: 8
+
+      - name: Install root deps (sql.js for the smoke fixture)
+        # The smoke creates a `.swarm/memory.db` fixture using `sql.js`
+        # imported from the repo root. Root has no `workspace:*` deps,
+        # so plain npm works here.
+        run: npm install --legacy-peer-deps --no-audit --no-fund --ignore-scripts
+
+      - name: Install workspace deps + build CLI (pnpm — `workspace:*` protocol)
+        # `cd v3/@claude-flow/cli && npm install` errors with
+        # `EUNSUPPORTEDPROTOCOL: Unsupported URL Type "workspace:"` because
+        # npm doesn't understand workspace:*. The pnpm workspace root is
+        # `v3/pnpm-workspace.yaml`. The CLI's tsc references project-refs to
+        # @claude-flow/swarm (and others), so those must be built first —
+        # `pnpm --filter @claude-flow/cli build` alone fails with TS6305.
+        # `--recursive --no-bail` builds the whole graph in topological order
+        # past unrelated package failures; we then assert the specific dist
+        # file the smoke imports.
+        working-directory: v3
+        run: |
+          pnpm install --frozen-lockfile=false --ignore-scripts
+          pnpm --recursive --no-bail run build || true
+          test -f @claude-flow/cli/dist/src/memory/memory-initializer.js \
+            || (echo "CLI build did not produce memory-initializer.js"; exit 1)
+
+      - name: Run memory stats legacy-DB smoke
+        run: node scripts/smoke-memory-stats-legacy-db.mjs
+
   github-safe-injection-smoke:
     # Regression guard for ruvnet/ruflo#2089 — ADR-127 Phase 1.
     #
@@ -1742,3 +1829,80 @@ jobs:
 
       - name: Run init-bundle invariants smoke
         run: node scripts/smoke-init-bundle-invariants.mjs
+
+  wasm-provider-bridge-smoke:
+    # ADR-129 Phase 1 — JsModelProvider routes WasmAgent through the v3
+    # provider system.  Pre-P1: set_model_provider() was never called and
+    # the echo-stub bypass competed with the WASM runtime.  P1 fix:
+    # attachJsModelProvider() is called at agent-creation time.
+    # Static-only smoke: no build, no API keys required.
+    name: wasm provider bridge smoke (ADR-129 P1)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run wasm provider bridge smoke
+        run: node scripts/smoke-wasm-provider-bridge.mjs
+
+  wasm-compose-smoke:
+    # ADR-129 Phase 2 — wasm_agent_compose MCP tool + addMcpTools bridge.
+    # Fixes the silent drop of template.mcp_tools in buildRvfFromTemplate.
+    # Static-only smoke: no build, no API keys required.
+    name: wasm compose smoke (ADR-129 P2)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run wasm compose smoke
+        run: node scripts/smoke-wasm-rvf-compose.mjs
+
+  wasm-gallery-crud-smoke:
+    # ADR-129 Phase 3 — 16 new MCP tools (10 gallery CRUD + 6 agent
+    # introspection), with AIDefence gate on wasm_gallery_import.
+    # Static-only smoke: no build, no API keys required.
+    name: wasm gallery CRUD smoke (ADR-129 P3)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run wasm gallery CRUD smoke
+        run: node scripts/smoke-wasm-gallery-crud.mjs
+
+  wasm-plugin-bridge-smoke:
+    # ADR-129 Phase 4 — plugin manifest "rvagent" field + includePlugins
+    # in wasm_agent_compose.  Static + behavioral fixture smoke.
+    name: wasm plugin bridge smoke (ADR-129 P4)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run wasm plugin bridge smoke
+        run: node scripts/smoke-wasm-plugin-bridge.mjs
